@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 # Цвета для вывода
@@ -8,14 +9,33 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Конфигурация
-CONFIG_DIR="$HOME/.mtproto"
+# --- НАСТРОЙКИ ---
+CONFIG_DIR="/root/.mtproto"
 USERS_FILE="$CONFIG_DIR/users.conf"
+SERVER_DOMAIN_FILE="$CONFIG_DIR/domain.txt"
 CONTAINER_PREFIX="mtproto-proxy"
-DEFAULT_DOMAIN="ya.ru"
 MSS_VALUE="1100"
 
-# Проверка на root (нужно для docker и iptables)
+# Регион сервера: "GLOBAL" (для Европы/Германии) или "RU" (для России)
+REGION="GLOBAL"
+
+# Списки доменов для FakeTLS
+DOMAINS_GLOBAL=(
+    "google.com" "microsoft.com" "cloudflare.com" "aws.amazon.com"
+    "github.com" "apple.com" "windowsupdate.com" "itunes.apple.com"
+    "netflix.com" "zoom.us" "linkedin.com" "twitch.tv" "bing.com"
+)
+
+DOMAINS_RU=(
+    "ya.ru" "vk.com" "mail.ru" "gosuslugi.ru" "sberbank.ru"
+    "dzen.ru" "avito.ru" "ozon.ru" "wildberries.ru" "yandex.ru"
+    "auto.ru" "kinopoisk.ru" "habr.com" "tinkoff.ru"
+)
+
+# Зарезервированные порты Marzban
+RESERVED_PORTS=(443 1080 10086 10087 2053 8443)
+
+# Проверка на root
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}❌ Скрипт необходимо запускать от имени root (sudo)${NC}"
     exit 1
@@ -35,30 +55,25 @@ get_docker_subnet() {
     [ -n "$s" ] && echo "$s" || echo "172.17.0.0/16"
 }
 
-# Функция динамического управления правилами MSS для порта
 manage_mss_rule() {
     local port="$1"
-    local action="$2" # "add" или "del"
+    local action="$2"
     local iface=$(get_iface)
     local subnet=$(get_docker_subnet)
 
     [ -z "$iface" ] && return 0
 
     if [ "$action" = "add" ]; then
-        # Добавляем PREROUTING (если еще нет)
         iptables -t mangle -C PREROUTING -i "$iface" -p tcp --dport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE" 2>/dev/null || \
         iptables -t mangle -I PREROUTING 1 -i "$iface" -p tcp --dport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE"
 
-        # Добавляем POSTROUTING (если еще нет)
         iptables -t mangle -C POSTROUTING -o "$iface" -s "$subnet" -p tcp --sport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE" 2>/dev/null || \
         iptables -t mangle -I POSTROUTING 1 -o "$iface" -s "$subnet" -p tcp --sport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE"
     elif [ "$action" = "del" ]; then
-        # Удаляем правила
         iptables -t mangle -D PREROUTING -i "$iface" -p tcp --dport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE" 2>/dev/null || true
         iptables -t mangle -D POSTROUTING -o "$iface" -s "$subnet" -p tcp --sport "$port" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS_VALUE" 2>/dev/null || true
     fi
 
-    # Сохраняем правила, если установлен пакет
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save >/dev/null 2>&1
     fi
@@ -80,23 +95,39 @@ generate_secret() {
     echo "ee${DOMAIN_HEX}${RANDOM_HEX}"
 }
 
+is_port_reserved() {
+    local p="$1"
+    for rp in "${RESERVED_PORTS[@]}"; do
+        [[ "$p" == "$rp" ]] && return 0
+    done
+    return 1
+}
+
 create_user_proxy() {
     local username="$1"
-    local domain="${2:-$DEFAULT_DOMAIN}"
-    local port="${3:-443}"
+    local domain="${2:-}"
+    local port="${3:-8443}"
+
+    if [ -z "$domain" ]; then
+        if [ "$REGION" = "RU" ]; then
+            local rand_idx=$((RANDOM % ${#DOMAINS_RU[@]}))
+            domain="${DOMAINS_RU[$rand_idx]}"
+        else
+            local rand_idx=$((RANDOM % ${#DOMAINS_GLOBAL[@]}))
+            domain="${DOMAINS_GLOBAL[$rand_idx]}"
+        fi
+    fi
 
     echo -e "${BLUE}🔧 Создание прокси для пользователя: $username${NC}"
 
     local secret=$(generate_secret "$domain")
 
-    # Находим свободный порт
-    if [ "$port" = "443" ]; then
-        if ss -tuln | grep -q ":443 "; then
-            port=8443
-            while ss -tuln | grep -q ":$port "; do
-                ((port++))
-            done
-        fi
+    if is_port_reserved "$port" || ss -tuln | grep -q ":$port "; then
+        echo -e "${YELLOW}⚠️ Порт $port занят или зарезервирован. Ищем свободный...${NC}"
+        port=8443
+        while is_port_reserved "$port" || ss -tuln | grep -q ":$port "; do
+            ((port++))
+        done
     fi
 
     local container_name="${CONTAINER_PREFIX}-${username}"
@@ -111,38 +142,32 @@ create_user_proxy() {
         telegrammessenger/proxy > /dev/null 2>&1
 
     if [ $? -eq 0 ]; then
-        local server_ip=$(curl -s api.ipify.org)
-        local tg_link="tg://proxy?server=${server_ip}&port=${port}&secret=${secret}"
-        local tme_link="https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}"
-
+        # Сохраняем только базовые данные, без ссылок
         cat > "$CONFIG_DIR/${username}.conf" << EOF
 USERNAME="$username"
-SERVER_IP="$server_ip"
 PORT="$port"
 SECRET="$secret"
 DOMAIN="$domain"
-TG_LINK="$tg_link"
-TME_LINK="$tme_link"
-CREATED="$(date -Is)"
 EOF
 
-        # Добавляем в список
         sed -i "/^${username}:/d" "$USERS_FILE" 2>/dev/null || true
         echo "$username:$port:$domain" >> "$USERS_FILE"
 
-        # АВТОМАТИЧЕСКИ ПРИМЕНЯЕМ ПРАВИЛА IPTABLES ДЛЯ НОВОГО ПОРТА
         manage_mss_rule "$port" "add"
 
+        local server_ip=$(curl -s api.ipify.org)
+        local srv_domain=""
+        [ -f "$SERVER_DOMAIN_FILE" ] && srv_domain=$(cat "$SERVER_DOMAIN_FILE")
+
         echo -e "${GREEN}✅ Прокси создан успешно!${NC}"
-        echo -e "📊 Данные для подключения:"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "👤 Пользователь: $username"
-        echo "🌐 Сервер: $server_ip"
-        echo "🔌 Порт: $port"
-        echo "🔑 Секрет: $secret"
-        echo "🌐 Домен: $domain"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "🔗 Ссылка: ${GREEN}${tme_link}${NC}\n"
+        echo -e "👤 Пользователь: $username"
+        echo -e "🔌 Порт: $port"
+        echo -e "🌐 Домен (FakeTLS): $domain"
+        echo -e "🔗 Ссылка (IP): ${GREEN}https://t.me/proxy?server=${server_ip}&port=${port}&secret=${secret}${NC}"
+        if [ -n "$srv_domain" ]; then
+            echo -e "🔗 Ссылка (Домен): ${GREEN}https://t.me/proxy?server=${srv_domain}&port=${port}&secret=${secret}${NC}"
+        fi
+        echo ""
     else
         echo -e "${RED}❌ Ошибка при создании прокси${NC}"
         return 1
@@ -153,7 +178,6 @@ delete_user_proxy() {
     local username="$1"
     local container_name="${CONTAINER_PREFIX}-${username}"
 
-    # Получаем порт перед удалением конфига, чтобы очистить iptables
     if [ -f "$CONFIG_DIR/${username}.conf" ]; then
         source "$CONFIG_DIR/${username}.conf"
         manage_mss_rule "$PORT" "del"
@@ -169,27 +193,34 @@ delete_user_proxy() {
 }
 
 list_users() {
-    echo -e "${BLUE}📋 Список активных прокси:${NC}"
+    echo -e "${BLUE}📋 Список активных прокси (отсортировано по портам):${NC}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     if [ ! -f "$USERS_FILE" ] || [ ! -s "$USERS_FILE" ]; then
         echo "Нет активных пользователей"
         return
     fi
 
+    local server_ip=$(curl -s api.ipify.org)
+    local srv_domain=""
+    [ -f "$SERVER_DOMAIN_FILE" ] && srv_domain=$(cat "$SERVER_DOMAIN_FILE")
+
     while IFS=':' read -r username port domain; do
         if [ -f "$CONFIG_DIR/${username}.conf" ]; then
             source "$CONFIG_DIR/${username}.conf"
-            echo "👤 $username | 🔌 $PORT | 🌐 $DOMAIN"
-            echo " 🔗 $TG_LINK"
-            echo " 🔗 $TME_LINK"
+            echo -e "👤 ${GREEN}$USERNAME${NC} | 🔌 ${YELLOW}$PORT${NC} | 🌐 $DOMAIN"
+            echo -e " 🔗 IP: https://t.me/proxy?server=${server_ip}&port=${PORT}&secret=${SECRET}"
+            if [ -n "$srv_domain" ]; then
+                echo -e " 🔗 Домен: https://t.me/proxy?server=${srv_domain}&port=${PORT}&secret=${SECRET}"
+            fi
+            echo ""
         fi
-    done < "$USERS_FILE"
+    done < <(sort -t':' -k2 -n "$USERS_FILE")
 }
 
 export_config() {
     local export_file="mtproto_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-    tar -C "$HOME" -czf "$export_file" ".mtproto"
-    echo -e "${GREEN}✅ Конфигурация экспортирована в: $export_file${NC}"
+    tar -C "/root" -czf "$export_file" ".mtproto"
+    echo -e "${GREEN}✅ Конфигурация экспортирована в: $(pwd)/$export_file${NC}"
 }
 
 import_config() {
@@ -199,7 +230,7 @@ import_config() {
         return 1
     fi
 
-    tar -xzf "$import_file" -C "$HOME"
+    tar -xzf "$import_file" -C "/root"
     echo -e "${GREEN}✅ Конфигурация распакована${NC}"
 
     : > "$USERS_FILE"
@@ -217,20 +248,18 @@ import_config() {
             -p "${PORT}:443" -e SECRET="${SECRET}" \
             telegrammessenger/proxy > /dev/null 2>&1
 
-        # Восстанавливаем правила iptables для импортированного порта
         manage_mss_rule "$PORT" "add"
 
         echo -e "🚀 Прокси для ${GREEN}${USERNAME}${NC} запущен на порту ${YELLOW}${PORT}${NC}"
     done
 }
 
-# --- ПЕРВИЧНАЯ НАСТРОЙКА СЕРВЕРА ---
 setup_server() {
-    echo -e "${BLUE}[1/4] Установка пакетов...${NC}"
+    echo -e "${BLUE}[1/5] Установка пакетов...${NC}"
     apt-get update -y
     apt-get install -y docker.io iptables-persistent curl openssl xxd conntrack
 
-    echo -e "${BLUE}[2/4] Настройка Docker (MTU=1400)...${NC}"
+    echo -e "${BLUE}[2/5] Настройка Docker (MTU=1400)...${NC}"
     systemctl enable --now docker
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json <<'EOF'
@@ -238,57 +267,54 @@ setup_server() {
 EOF
     systemctl restart docker
 
-    echo -e "${BLUE}[3/4] Настройка ядра (BBR и tcp_mtu_probing)...${NC}"
+    echo -e "${BLUE}[3/5] Настройка ядра (BBR и tcp_mtu_probing)...${NC}"
     printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" > /etc/sysctl.d/98-bbr.conf
     printf "net.ipv4.tcp_mtu_probing=1\n" > /etc/sysctl.d/99-mtproxy-mtu.conf
     sysctl --system >/dev/null || true
 
-    echo -e "${BLUE}[4/4] Восстановление правил для существующих пользователей...${NC}"
+    echo -e "${BLUE}[4/5] Восстановление правил для существующих пользователей...${NC}"
     if [ -f "$USERS_FILE" ]; then
         while IFS=':' read -r username port domain; do
             manage_mss_rule "$port" "add"
         done < "$USERS_FILE"
     fi
 
+    echo -e "${BLUE}[5/5] Настройка домена сервера...${NC}"
+    read -p "Введите домен вашего сервера для генерации ссылок (нажмите Enter, чтобы пропустить): " srv_domain
+    if [ -n "$srv_domain" ]; then
+        echo "$srv_domain" > "$SERVER_DOMAIN_FILE"
+        echo -e "${GREEN}Домен $srv_domain сохранен локально.${NC}"
+    else
+        rm -f "$SERVER_DOMAIN_FILE"
+        echo -e "${YELLOW}Домен не указан, будут генерироваться только IP-ссылки.${NC}"
+    fi
+
     echo -e "${GREEN}✅ Базовая настройка сервера завершена!${NC}"
-    echo "Теперь вы можете создавать пользователей командой: $0 create <имя>"
 }
 
-# --- ГЛАВНОЕ МЕНЮ ---
 case "${1:-help}" in
-    setup)
-        setup_server
-        ;;
+    setup) setup_server ;;
     create)
         [ -z "${2:-}" ] && { echo "Укажите имя пользователя!"; exit 1; }
-        create_user_proxy "$2" "${3:-$DEFAULT_DOMAIN}" "${4:-443}"
+        create_user_proxy "$2" "${3:-}" "${4:-8443}"
         ;;
     delete)
         [ -z "${2:-}" ] && { echo "Укажите имя пользователя!"; exit 1; }
         delete_user_proxy "$2"
         ;;
-    list)
-        list_users
-        ;;
-    export)
-        export_config
-        ;;
+    list) list_users ;;
+    export) export_config ;;
     import)
         [ -z "${2:-}" ] && { echo "Укажите файл бэкапа!"; exit 1; }
         import_config "$2"
         ;;
     *)
         echo -e "${YELLOW}Использование:${NC}"
-        echo "  $0 setup                               - Первичная настройка сервера (Docker, BBR, MTU)"
-        echo "  $0 create <username> [domain] [port]   - Создать прокси (правила iptables применятся сами)"
-        echo "  $0 delete <username>                   - Удалить прокси (правила iptables удалятся сами)"
+        echo "  $0 setup                               - Первичная настройка сервера"
+        echo "  $0 create <username> [domain] [port]   - Создать прокси (домен и порт можно пропустить)"
+        echo "  $0 delete <username>                   - Удалить прокси"
         echo "  $0 list                                - Список всех прокси"
         echo "  $0 export                              - Экспортировать конфиги"
         echo "  $0 import <file>                       - Импортировать конфиги"
-        echo ""
-        echo -e "${YELLOW}Пример рабочего процесса:${NC}"
-        echo "  1. ./mtproto.sh setup"
-        echo "  2. ./mtproto.sh create ivan ya.ru 443"
-        echo "  3. ./mtproto.sh create maria max.ru 8443"
         ;;
 esac
