@@ -144,7 +144,6 @@ create_user_proxy() {
         telegrammessenger/proxy > /dev/null 2>&1
 
     if [ $? -eq 0 ]; then
-        # Сохраняем только базовые данные, без ссылок
         cat > "$CONFIG_DIR/${username}.conf" << EOF
 USERNAME="$username"
 PORT="$port"
@@ -152,8 +151,13 @@ SECRET="$secret"
 DOMAIN="$domain"
 EOF
 
-        sed -i "/^${username}:/d" "$USERS_FILE" 2>/dev/null || true
-        echo "$username:$port:$domain" >> "$USERS_FILE"
+        # Добавляем пользователя в users.conf, если его там нет
+        if ! grep -q "^${username}:" "$USERS_FILE" 2>/dev/null; then
+            echo "$username:$port:$domain" >> "$USERS_FILE"
+        else
+            # Обновляем существующую запись
+            sed -i "/^${username}:/c\\${username}:${port}:${domain}" "$USERS_FILE"
+        fi
 
         manage_mss_rule "$port" "add"
 
@@ -181,8 +185,9 @@ delete_user_proxy() {
     local container_name="${CONTAINER_PREFIX}-${username}"
 
     if [ -f "$CONFIG_DIR/${username}.conf" ]; then
-        source "$CONFIG_DIR/${username}.conf"
-        manage_mss_rule "$PORT" "del"
+        # Используем grep/cut для безопасного извлечения порта
+        local port_to_del=$(grep -E '^PORT=' "$CONFIG_DIR/${username}.conf" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+        [ -n "$port_to_del" ] && manage_mss_rule "$port_to_del" "del"
     fi
 
     docker stop "$container_name" 2>/dev/null || true
@@ -202,22 +207,69 @@ list_users() {
         return
     fi
 
-    local server_ip=$(curl -s api.ipify.org)
+    local server_ip
+    server_ip=$(curl -s api.ipify.org || echo "127.0.0.1")
     local srv_domain=""
-    [ -f "$SERVER_DOMAIN_FILE" ] && srv_domain=$(cat "$SERVER_DOMAIN_FILE")
+    [ -f "$SERVER_DOMAIN_FILE" ] && srv_domain=$(cat "$SERVER_DOMAIN_FILE" 2>/dev/null || true)
 
+    # Читаем файл, удаляем \r и пустые строки, сортируем по 2 колонке (порт)
+    # || true в конце гарантирует, что set -e не убьет скрипт при ошибке сортировки
     while IFS=':' read -r username port domain; do
-        if [ -f "$CONFIG_DIR/${username}.conf" ]; then
-            source "$CONFIG_DIR/${username}.conf"
-            echo -e "👤 ${GREEN}$USERNAME${NC} | 🔌 ${YELLOW}$PORT${NC} | 🌐 $DOMAIN"
-            echo -e " 🔗 IP: https://t.me/proxy?server=${server_ip}&port=${PORT}&secret=${SECRET}"
-            if [ -n "$srv_domain" ]; then
-                echo -e " 🔗 Домен: https://t.me/proxy?server=${srv_domain}&port=${PORT}&secret=${SECRET}"
+        [ -z "$username" ] && continue
+
+        local conf_file="$CONFIG_DIR/${username}.conf"
+        if [ -f "$conf_file" ]; then
+            # Безопасное извлечение данных. || true спасает от падения скрипта из-за pipefail
+            local c_user c_port c_secret c_domain
+            c_user=$(grep -E '^USERNAME=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_port=$(grep -E '^PORT=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_secret=$(grep -E '^SECRET=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_domain=$(grep -E '^DOMAIN=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+
+            # Если в конфиге почему-то пусто, берем данные из users.conf
+            [ -z "$c_user" ] && c_user="$username"
+            [ -z "$c_port" ] && c_port="$port"
+            [ -z "$c_domain" ] && c_domain="$domain"
+
+            if [ -n "$c_secret" ]; then
+                echo -e "👤 ${GREEN}${c_user}${NC} | 🔌 ${YELLOW}${c_port}${NC} | 🌐 ${c_domain}"
+                echo -e " 🔗 IP: https://t.me/proxy?server=${server_ip}&port=${c_port}&secret=${c_secret}"
+                if [ -n "$srv_domain" ]; then
+                    echo -e " 🔗 Домен: https://t.me/proxy?server=${srv_domain}&port=${c_port}&secret=${c_secret}"
+                fi
+                echo ""
+            else
+                echo -e "${RED}⚠️ Ошибка: у ${username} нет SECRET в конфиге!${NC}\n"
             fi
-            echo ""
+        else
+            echo -e "${RED}⚠️ Ошибка: конфиг ${conf_file} не найден!${NC}\n"
         fi
-    done < <(sort -t':' -k2 -n "$USERS_FILE")
+    done < <(cat "$USERS_FILE" | tr -d '\r' | grep -v '^\s*$' | sort -t':' -k2 -n || true)
 }
+
+rebuild_users_file() {
+    echo -e "${BLUE}🔄 Перестраиваем файл $USERS_FILE из существующих конфигов...${NC}"
+    : > "$USERS_FILE" # Очищаем файл перед заполнением
+
+    for conf_file in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf_file" ] || continue
+        # Пропускаем сам users.conf, если он вдруг попал в список
+        [[ "$conf_file" == "$USERS_FILE" ]] && continue
+
+        local username=$(grep -E '^USERNAME=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+        local port=$(grep -E '^PORT=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+        local domain=$(grep -E '^DOMAIN=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+
+        if [ -n "$username" ] && [ -n "$port" ] && [ -n "$domain" ]; then
+            echo "$username:$port:$domain" >> "$USERS_FILE"
+            echo -e "  ✅ Добавлен: ${GREEN}$username${NC}"
+        else
+            echo -e "  ❌ Пропущен: ${YELLOW}$conf_file${NC} (неполные данные)${NC}"
+        fi
+    done
+    echo -e "${GREEN}✅ Файл $USERS_FILE успешно перестроен.${NC}"
+}
+
 
 export_config() {
     local export_file="mtproto_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
@@ -235,26 +287,88 @@ import_config() {
     tar -xzf "$import_file" -C "/root"
     echo -e "${GREEN}✅ Конфигурация распакована${NC}"
 
-    : > "$USERS_FILE"
-
-    for conf in "$CONFIG_DIR"/*.conf; do
-        [ -e "$conf" ] || continue
-        [ "$conf" = "$USERS_FILE" ] && continue
-
-        source "$conf"
-        echo "$USERNAME:$PORT:$DOMAIN" >> "$USERS_FILE"
-
-        docker rm -f "${CONTAINER_PREFIX}-${USERNAME}" 2>/dev/null || true
-
-        docker run -d --name "${CONTAINER_PREFIX}-${USERNAME}" --restart unless-stopped \
-            -p "${PORT}:443" -e SECRET="${SECRET}" \
-            telegrammessenger/proxy > /dev/null 2>&1
-
-        manage_mss_rule "$PORT" "add"
-
-        echo -e "🚀 Прокси для ${GREEN}${USERNAME}${NC} запущен на порту ${YELLOW}${PORT}${NC}"
-    done
+    sync_all_proxies
 }
+
+check_proxy_status() {
+    echo -e "${BLUE}🔍 Проверка статуса прокси-контейнеров:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ ! -f "$USERS_FILE" ] || [ ! -s "$USERS_FILE" ]; then
+        echo "Нет настроенных пользователей"
+        return
+    fi
+
+    while IFS=':' read -r username port domain; do
+        [ -z "$username" ] && continue
+        local container_name="${CONTAINER_PREFIX}-${username}"
+        local status=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}" 2>/dev/null || true)
+
+        if [[ "$status" == *"Up"* ]]; then
+            echo -e "👤 ${GREEN}$username${NC} | Статус: ${GREEN}Запущен${NC} (Порт: $port)"
+        elif [[ "$status" == *"Exited"* ]]; then
+            echo -e "👤 ${YELLOW}$username${NC} | Статус: ${YELLOW}Остановлен${NC} (Порт: $port)"
+        else
+            echo -e "👤 ${RED}$username${NC} | Статус: ${RED}Не найден${NC} (Конфиг есть, контейнера нет)"
+        fi
+    done < <(cat "$USERS_FILE" | tr -d '\r' | grep -v '^\s*$' | sort -t':' -k2 -n || true)
+    echo ""
+}
+
+sync_all_proxies() {
+    echo -e "${BLUE}🚀 Синхронизация и запуск всех прокси...${NC}"
+    rebuild_users_file # Убедимся, что users.conf актуален
+
+    if [ ! -f "$USERS_FILE" ] || [ ! -s "$USERS_FILE" ]; then
+        echo "Нет пользователей для запуска."
+        return
+    fi
+
+    while IFS=':' read -r username port domain; do
+        [ -z "$username" ] && continue
+        local conf_file="$CONFIG_DIR/${username}.conf"
+        local container_name="${CONTAINER_PREFIX}-${username}"
+
+        if [ -f "$conf_file" ]; then
+            local c_user c_port c_secret c_domain
+            c_user=$(grep -E '^USERNAME=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_port=$(grep -E '^PORT=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_secret=$(grep -E '^SECRET=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            c_domain=$(grep -E '^DOMAIN=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+
+            if [ -n "$c_user" ] && [ -n "$c_port" ] && [ -n "$c_secret" ]; then
+                local status=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}" 2>/dev/null || true)
+
+                if [[ "$status" == *"Up"* ]]; then
+                    echo -e "  ✅ ${GREEN}$c_user${NC} уже запущен."
+                else
+                    echo -e "  🔄 ${YELLOW}$c_user${NC}: Контейнер не запущен или не существует. Пересоздаем..."
+                    docker stop "$container_name" 2>/dev/null || true
+                    docker rm "$container_name" 2>/dev/null || true
+
+                    docker run -d \
+                        --name "$container_name" \
+                        --restart unless-stopped \
+                        -p "${c_port}:443" \
+                        -e SECRET="$c_secret" \
+                        telegrammessenger/proxy > /dev/null 2>&1
+
+                    if [ $? -eq 0 ]; then
+                        manage_mss_rule "$c_port" "add"
+                        echo -e "  🚀 ${GREEN}$c_user${NC} успешно запущен на порту ${c_port}."
+                    else
+                        echo -e "  ❌ ${RED}Ошибка запуска ${c_user}${NC}."
+                    fi
+                fi
+            else
+                echo -e "  ❌ ${RED}Пропущен ${username}: неполные данные в конфиге ${conf_file}${NC}"
+            fi
+        else
+            echo -e "  ❌ ${RED}Пропущен ${username}: конфиг ${conf_file} не найден!${NC}"
+        fi
+    done < <(cat "$USERS_FILE" | tr -d '\r' | grep -v '^\s*$' | sort -t':' -k2 -n || true)
+    echo -e "${GREEN}✅ Синхронизация завершена.${NC}"
+}
+
 
 setup_server() {
     echo -e "${BLUE}[1/5] Установка пакетов...${NC}"
@@ -277,8 +391,11 @@ EOF
     echo -e "${BLUE}[4/5] Восстановление правил для существующих пользователей...${NC}"
     if [ -f "$USERS_FILE" ]; then
         while IFS=':' read -r username port domain; do
-            manage_mss_rule "$port" "add"
-        done < "$USERS_FILE"
+            # Используем grep/cut для безопасного извлечения порта
+            local conf_file="$CONFIG_DIR/${username}.conf"
+            local current_port=$(grep -E '^PORT=' "$conf_file" | cut -d'=' -f2- | tr -d '"'\''\r' || true)
+            [ -n "$current_port" ] && manage_mss_rule "$current_port" "add"
+        done < <(cat "$USERS_FILE" | tr -d '\r' | grep -v '^\s*$' || true)
     fi
 
     echo -e "${BLUE}[5/5] Настройка домена сервера...${NC}"
@@ -310,6 +427,9 @@ case "${1:-help}" in
         [ -z "${2:-}" ] && { echo "Укажите файл бэкапа!"; exit 1; }
         import_config "$2"
         ;;
+    rebuild) rebuild_users_file ;;
+    check) check_proxy_status ;;
+    sync) sync_all_proxies ;;
     *)
         echo -e "${YELLOW}Использование:${NC}"
         echo "  $0 setup                               - Первичная настройка сервера"
@@ -318,5 +438,8 @@ case "${1:-help}" in
         echo "  $0 list                                - Список всех прокси"
         echo "  $0 export                              - Экспортировать конфиги"
         echo "  $0 import <file>                       - Импортировать конфиги"
+        echo "  $0 rebuild                             - Перестроить users.conf из файлов конфигов"
+        echo "  $0 check                               - Проверить статус всех прокси"
+        echo "  $0 sync                                - Запустить/перезапустить все прокси по конфигам"
         ;;
 esac
