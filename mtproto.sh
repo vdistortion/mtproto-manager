@@ -24,12 +24,14 @@ DOMAINS_GLOBAL=(
     "google.com" "microsoft.com" "cloudflare.com" "aws.amazon.com"
     "github.com" "apple.com" "windowsupdate.com" "itunes.apple.com"
     "netflix.com" "zoom.us" "linkedin.com" "twitch.tv" "bing.com"
+    "wikipedia.org" "yahoo.com" "reddit.com" "spotify.com"
 )
 
 DOMAINS_RU=(
     "ya.ru" "vk.com" "mail.ru" "gosuslugi.ru" "sberbank.ru"
     "dzen.ru" "avito.ru" "ozon.ru" "wildberries.ru" "yandex.ru"
-    "auto.ru" "kinopoisk.ru" "habr.com" "tinkoff.ru"
+    "auto.ru" "kinopoisk.ru" "habr.com" "tbank.ru" "max.ru"
+    "rutube.ru" "lenta.ru" "rbc.ru" "ok.ru"
 )
 
 # Зарезервированные порты Marzban
