@@ -291,11 +291,11 @@ sync_all_proxies() {
 }
 
 setup_server() {
-    echo -e "${BLUE}[1/5] Установка пакетов...${NC}"
+    echo -e "${BLUE}[1/6] Установка пакетов...${NC}"
     apt-get update -y
     apt-get install -y docker.io iptables-persistent curl openssl xxd conntrack
 
-    echo -e "${BLUE}[2/5] Настройка Docker (MTU=1400)...${NC}"
+    echo -e "${BLUE}[2/6] Настройка Docker (MTU=1400)...${NC}"
     systemctl enable --now docker
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json <<'EOF'
@@ -303,19 +303,32 @@ setup_server() {
 EOF
     systemctl restart docker
 
-    echo -e "${BLUE}[3/5] Настройка ядра (BBR и tcp_mtu_probing)...${NC}"
+    echo -e "${BLUE}[3/6] Настройка ядра (BBR и tcp_mtu_probing)...${NC}"
     printf "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" > /etc/sysctl.d/98-bbr.conf
     printf "net.ipv4.tcp_mtu_probing=1\n" > /etc/sysctl.d/99-mtproxy-mtu.conf
     sysctl --system >/dev/null || true
 
-    echo -e "${BLUE}[4/5] Восстановление правил для существующих пользователей...${NC}"
+    echo -e "${BLUE}[4/6] Восстановление правил для существующих пользователей...${NC}"
     if [ -s "$USERS_FILE" ]; then
         while IFS=':' read -r username port domain secret; do
             [ -n "$port" ] && manage_mss_rule "$port" "add"
         done < <(cat "$USERS_FILE" | tr -d '\r' | grep -v '^\s*$' || true)
     fi
 
-    echo -e "${BLUE}[5/5] Настройка домена сервера...${NC}"
+    echo -e "${BLUE}[5/6] Настройка региона...${NC}"
+    echo "Выберите регион сервера:"
+    echo "  1) GLOBAL — Европа/США (google.com, apple.com...)"
+    echo "  2) RU     — Россия (ya.ru, vk.com...)"
+    read -p "Регион [1/2, по умолчанию 1]: " region_choice
+    if [[ "$region_choice" == "2" ]]; then
+        sed -i 's/^REGION=.*/REGION="RU"/' "$0"
+        echo "Регион установлен: RU"
+    else
+        sed -i 's/^REGION=.*/REGION="GLOBAL"/' "$0"
+        echo "Регион установлен: GLOBAL"
+    fi
+
+    echo -e "${BLUE}[6/6] Настройка домена сервера...${NC}"
     read -p "Введите домен вашего сервера для генерации ссылок (нажмите Enter, чтобы пропустить): " srv_domain
     if [ -n "$srv_domain" ]; then
         echo "$srv_domain" > "$SERVER_DOMAIN_FILE"
